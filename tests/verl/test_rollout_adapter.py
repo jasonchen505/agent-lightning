@@ -1,0 +1,1089 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import sys
+import weakref
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, ClassVar
+
+import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("tensordict")
+pytest.importorskip("verl")
+
+import numpy as np
+import torch
+
+from agentlightning.verl import rollout_adapter as rollout_adapter_module
+from agentlightning.verl.agl_rollout_manager import CompletedRollout, Triplet
+from agentlightning.verl.rollout_adapter import RolloutAdapter, _build_routed_experts_batch
+
+
+class FakeTokenizer:
+    all_special_ids: ClassVar[list[int]] = []
+
+    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+        return " ".join(str(i) for i in ids)
+
+
+def _encode_routes(routes: np.ndarray) -> str:
+    buffer = io.BytesIO()
+    np.save(buffer, routes, allow_pickle=False)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.int64])
+def test_routed_experts_batch_preserves_padding_and_truncation(dtype: type[np.generic]) -> None:
+    rows = []
+    for tokens, original_prompt_length, prompt_length, response_length in [
+        ([10, 11, 12, 13], 2, 2, 3),
+        ([20, 21, 22, 23, 24, 25, 26], 6, 4, 2),
+        ([30, 31, 32, 33, 34, 35, 36], 1, 1, 3),
+    ]:
+        routes = (np.array(tokens)[:, None, None] * 4 + np.arange(4).reshape(1, 2, 2)).astype(dtype)
+        rows.append((_encode_routes(routes), original_prompt_length, prompt_length, response_length))
+
+    batch = _build_routed_experts_batch(rows, 4, 3, torch.device("cpu"))
+
+    expected = torch.zeros((3, 7, 2, 2), dtype=torch.uint8)
+    for row, tokens in enumerate([[0, 0, 10, 11, 12, 13, 0], [20, 21, 22, 23, 26, 0, 0], [0, 0, 0, 30, 31, 32, 33]]):
+        for position, token in enumerate(tokens):
+            if token:
+                expected[row, position] = torch.arange(4, dtype=torch.uint8).reshape(2, 2) + token * 4
+    torch.testing.assert_close(batch, expected, rtol=0, atol=0)
+
+
+def test_routed_experts_batch_releases_decoded_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _encode_routes(np.arange(48, dtype=np.uint8).reshape(12, 2, 2))
+    decoded: list[weakref.ReferenceType[np.ndarray]] = []
+    load = np.load
+
+    def tracked_load(*args, **kwargs):
+        assert all(ref() is None for ref in decoded), "Previous decoded routes are still retained"
+        routes = load(*args, **kwargs)
+        decoded.append(weakref.ref(routes))
+        return routes
+
+    monkeypatch.setattr(rollout_adapter_module.np, "load", tracked_load)
+    batch = _build_routed_experts_batch([(payload, 4, 4, 3)] * 4, 4, 3, torch.device("cpu"))
+
+    assert len(decoded) == 4
+    assert all(ref() is None for ref in decoded)
+    expected = torch.arange(28, dtype=torch.uint8).reshape(7, 2, 2).expand(4, -1, -1, -1)
+    torch.testing.assert_close(batch, expected, rtol=0, atol=0)
+
+
+def test_routed_experts_batch_rejects_short_route_sequence() -> None:
+    valid = _encode_routes(np.zeros((4, 2, 2), dtype=np.uint8))
+    short = _encode_routes(np.zeros((3, 2, 2), dtype=np.uint8))
+    with pytest.raises(RuntimeError, match="R3 routed_experts is shorter than its token sequence"):
+        _build_routed_experts_batch([(valid, 2, 2, 3), (short, 2, 2, 3)], 4, 3, torch.device("cpu"))
+
+
+class FakeTable:
+    def __init__(self, columns: list[str]) -> None:
+        self.columns = columns
+        self.rows: list[list[object]] = []
+
+    def add_data(self, *values: object) -> None:
+        self.rows.append(list(values))
+
+
+class FakeArtifactFile:
+    def __init__(self, artifact: FakeArtifact, name: str, mode: str) -> None:
+        self.artifact = artifact
+        self.name = name
+        self.mode = mode
+        self.content: str | bytes = b"" if "b" in mode else ""
+
+    def __enter__(self) -> FakeArtifactFile:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.artifact.files.append({"name": self.name, "content": self.content})
+
+    def write(self, value: str | bytes) -> int:
+        if "b" in self.mode:
+            assert isinstance(value, bytes)
+            assert isinstance(self.content, bytes)
+            self.content += value
+            return len(value)
+        assert isinstance(value, str)
+        assert isinstance(self.content, str)
+        self.content += value
+        return len(value)
+
+
+class FakeArtifact:
+    def __init__(self, name: str, type: str, metadata: dict[str, object] | None = None) -> None:
+        self.name = name
+        self.type = type
+        self.metadata = metadata or {}
+        self.files: list[dict[str, str | bytes]] = []
+
+    def new_file(self, name: str, mode: str = "w") -> FakeArtifactFile:
+        assert mode in {"w", "wb"}
+        return FakeArtifactFile(self, name, mode)
+
+
+class FakeRun:
+    id = "fake-run"
+
+    def __init__(self) -> None:
+        self.artifacts: list[FakeArtifact] = []
+
+    def log_artifact(self, artifact: FakeArtifact) -> None:
+        self.artifacts.append(artifact)
+
+
+def _logged_table(logged: list[tuple[dict[str, FakeTable], int]], key: str) -> tuple[FakeTable, int]:
+    matches = [(data[key], step) for data, step in logged if key in data]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _zipped_jsonl_records(
+    artifact: FakeArtifact,
+    *,
+    artifact_path: str,
+    jsonl_name: str,
+) -> list[dict[str, object]]:
+    matches = [file for file in artifact.files if file["name"] == artifact_path]
+    assert len(matches) == 1
+    content = matches[0]["content"]
+    assert isinstance(content, bytes)
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        assert archive.namelist() == [jsonl_name]
+        jsonl_text = archive.read(jsonl_name).decode("utf-8")
+    return [json.loads(line) for line in jsonl_text.splitlines()]
+
+
+def _install_fake_wandb(monkeypatch: pytest.MonkeyPatch, logged: list[tuple[dict[str, FakeTable], int]]) -> FakeRun:
+    run = FakeRun()
+    monkeypatch.setitem(
+        sys.modules,
+        "wandb",
+        SimpleNamespace(
+            run=run,
+            Table=FakeTable,
+            Artifact=FakeArtifact,
+            log=lambda data, step: logged.append((data, step)),
+        ),
+    )
+    return run
+
+
+def _adapter() -> RolloutAdapter:
+    return RolloutAdapter(
+        max_prompt_length=4,
+        max_response_length=3,
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        trace_aggregator_level="trajectory",
+        tokenizer=FakeTokenizer(),
+    )
+
+
+def _triplet(prompt_ids: list[int], response_ids: list[int]) -> Triplet:
+    return Triplet(
+        prompt={"token_ids": prompt_ids},
+        response={"token_ids": response_ids, "log_probs": [-0.1] * len(response_ids)},
+    )
+
+
+@pytest.mark.parametrize("prefix_mismatch", [False, True], ids=["initial-group", "restarted-group"])
+@pytest.mark.parametrize("missing_log_probs", [False, True], ids=["with-log-probs", "missing-log-probs"])
+def test_trajectory_aggregation_preserves_input_log_probs(prefix_mismatch: bool, missing_log_probs: bool) -> None:
+    triplets = [
+        Triplet(
+            prompt={"token_ids": [10]},
+            response={"token_ids": [20], "log_probs": None if missing_log_probs else [-0.25]},
+        ),
+        Triplet(
+            prompt={"token_ids": [10, 20, 30]},
+            response={"token_ids": [40, 50], "log_probs": [-0.5, -0.75]},
+        ),
+    ]
+    expected_responses = [[20, 30, 40, 50, 0]]
+    expected_masks = [[1, 0, 1, 1, 0]]
+    expected_log_probs = [[-0.25, 0.0, -0.5, -0.75, 0.0]]
+    if prefix_mismatch:
+        triplets.insert(0, _triplet([90], [91]))
+        expected_responses.insert(0, [91, 0, 0, 0, 0])
+        expected_masks.insert(0, [1, 0, 0, 0, 0])
+        expected_log_probs.insert(0, [-0.1, 0.0, 0.0, 0.0, 0.0])
+    rollout = CompletedRollout(
+        rollout_id="r1",
+        data_id="data-1",
+        step=0,
+        sample_idx_in_step=0,
+        enqueue_time=0.0,
+        final_reward=1.0,
+        triplets=triplets,
+    )
+    original_rollout = rollout.model_copy(deep=True)
+    adapter = RolloutAdapter(
+        max_prompt_length=4,
+        max_response_length=5,
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        trace_aggregator_level="trajectory",
+        tokenizer=FakeTokenizer(),
+    )
+
+    first, first_metrics = adapter.get_train_data_batch([rollout])
+
+    assert rollout == original_rollout
+    assert first.batch is not None
+    assert first.batch["responses"].tolist() == expected_responses
+    assert first.batch["response_mask"].tolist() == expected_masks
+    if missing_log_probs:
+        assert "rollout_log_probs" not in first.batch
+    else:
+        torch.testing.assert_close(first.batch["rollout_log_probs"], torch.tensor(expected_log_probs))
+    row_count = len(expected_responses)
+    assert first.non_tensor_batch["data_id_list"].tolist() == ["data-1"] * row_count
+    assert first.non_tensor_batch["rollout_id_list"].tolist() == ["r1"] * row_count
+
+    second, second_metrics = adapter.get_train_data_batch([rollout])
+
+    assert rollout == original_rollout
+    assert second.batch is not None
+    assert set(second.batch.keys()) == set(first.batch.keys())
+    for key, value in first.batch.items():
+        torch.testing.assert_close(second.batch[key], value)
+    for key in ("data_id_list", "rollout_id_list"):
+        assert second.non_tensor_batch[key].tolist() == first.non_tensor_batch[key].tolist()
+    assert second_metrics == first_metrics
+
+
+def test_trajectory_prefix_mismatch_uploads_trace_merge_table_to_wandb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[tuple[dict[str, FakeTable], int]] = []
+    _install_fake_wandb(monkeypatch, logged)
+
+    rollout = CompletedRollout(
+        rollout_id="r1",
+        data_id="data-1",
+        step=17,
+        sample_idx_in_step=0,
+        enqueue_time=0.0,
+        final_reward=0.5,
+        triplets=[
+            _triplet([1], [2]),
+            _triplet([9], [10]),
+        ],
+    )
+
+    batch, metrics = _adapter().get_train_data_batch([rollout], global_steps=17)
+
+    assert metrics["training/n_unmerged_rollouts"] == 1
+    assert metrics["training/n_trace_merge_mismatch_rows"] == 1
+    assert batch.batch["prompts"].tolist() == [[0, 0, 0, 1], [0, 0, 0, 9]]
+    assert batch.batch["responses"].tolist() == [[2, 0, 0], [10, 0, 0]]
+    assert batch.batch["response_mask"].tolist() == [[1, 0, 0], [1, 0, 0]]
+
+    table, step = _logged_table(logged, "training/trace_merge_mismatches")
+    assert step == 17
+    assert table.columns[0] == "global_steps"
+    assert table.columns[-2:] == ["previous_trace", "current_trace"]
+    assert {"template_mismatch", "retoken_mismatch", "others_mismatch"}.isdisjoint(table.columns)
+    assert table.rows == [
+        [
+            17,
+            "r1",
+            "data-1",
+            1,
+            1,
+            1,
+            2,
+            2,
+            "1 2",
+            "9 10",
+        ]
+    ]
+
+
+def test_trajectory_prefix_mismatch_wandb_table_is_capped_at_100(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[tuple[dict[str, FakeTable], int]] = []
+    _install_fake_wandb(monkeypatch, logged)
+    rollout = CompletedRollout(
+        rollout_id="r1",
+        data_id="data-1",
+        step=9,
+        sample_idx_in_step=0,
+        enqueue_time=0.0,
+        final_reward=0.5,
+        triplets=[_triplet([turn * 2 + 1], [turn * 2 + 2]) for turn in range(102)],
+    )
+
+    _adapter().get_train_data_batch([rollout], global_steps=9)
+
+    table, _ = _logged_table(logged, "training/trace_merge_mismatches")
+    assert len(table.rows) == 100
+    assert table.rows[0][3] == 1
+    assert table.rows[-1][3] == 100
+
+
+def test_mismatch_classification_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[int]] = []
+
+    class CountedTokenizer(FakeTokenizer):
+        def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+            calls.append(list(ids))
+            return "hello world" if ids == [1, 2] else "hello world obs"
+
+    logged: list[tuple[dict[str, FakeTable], int]] = []
+    _install_fake_wandb(monkeypatch, logged)
+    rollout = _transition_rollout([_triplet([1], [2]), _triplet([3, 4], [2])])
+    adapter = _adapter()
+    adapter.tokenizer = CountedTokenizer()
+    adapter.get_train_data_batch([rollout])
+
+    table, _ = _logged_table(logged, "training/trace_merge_mismatches")
+    row = dict(zip(table.columns, table.rows[0], strict=True))
+    assert {"template_mismatch", "retoken_mismatch", "others_mismatch"}.isdisjoint(row)
+    # The two trace-text decodes and two trajectory-summary decodes already existed.
+    assert len(calls) == 4
+
+
+@pytest.mark.parametrize("enabled", [None, False, True], ids=["missing", "disabled", "enabled"])
+@pytest.mark.parametrize("score_centering", [False, True])
+def test_trainer_forwards_mismatch_classification_config(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool | None, score_centering: bool
+) -> None:
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+
+    from agentlightning.verl.trainer import AgentLightningRayPPOTrainer
+
+    config = OmegaConf.load(Path(rollout_adapter_module.__file__).with_name("config.yaml"))
+    assert config.agentlightning.trace_aggregator.classify_trace_merge_mismatches is False
+    if enabled is None:
+        del config.agentlightning.trace_aggregator.classify_trace_merge_mismatches
+    else:
+        config.agentlightning.trace_aggregator.classify_trace_merge_mismatches = enabled
+    config.data.max_prompt_length = 4
+    config.data.max_response_length = 3
+    if score_centering:
+        config.actor_rollout_ref.actor.policy_loss.loss_mode = "score_centering"
+    calls: list[list[int]] = []
+
+    class CountedTokenizer(FakeTokenizer):
+        pad_token_id = 0
+
+        def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+            calls.append(list(ids))
+            return "hello world" if ids == [1, 2] else "hello world obs"
+
+    logged: list[tuple[dict[str, FakeTable], int]] = []
+    _install_fake_wandb(monkeypatch, logged)
+    rollout = _transition_rollout([_triplet([1], [2]), _triplet([3, 4], [2])])
+    assert rollout.triplets is not None
+    for triplet in rollout.triplets:
+        triplet.response["score_centering_token_ids"] = [[2]]
+        triplet.response["score_centering_log_probs"] = [[-0.1]]
+    manager = SimpleNamespace(
+        delete_model=lambda: None,
+        register_model=lambda addresses: None,
+        enqueue_and_wait_until_completed=lambda data, is_train: [rollout],
+    )
+    trainer = object.__new__(AgentLightningRayPPOTrainer)
+    for name, value in {
+        "config": config,
+        "tokenizer": CountedTokenizer(),
+        "is_async": False,
+        "global_steps": 0,
+        "async_rollout_manager": SimpleNamespace(server_addresses=[]),
+        "_resume_all_rollout_generation": lambda: None,
+        "_abort_all_rollout_requests": lambda: None,
+        "_make_rollout_manager": lambda cls: manager,
+        "_rollout_lifecycle_metrics": lambda rollouts: {},
+    }.items():
+        monkeypatch.setattr(trainer, name, value, raising=False)
+    batch, _ = AgentLightningRayPPOTrainer._rollout(trainer, rollout_adapter_module.DataProto(batch=None), True)
+
+    table, _ = _logged_table(logged, "training/trace_merge_mismatches")
+    row = dict(zip(table.columns, table.rows[0], strict=True))
+    if enabled:
+        assert (row["template_mismatch"], row["retoken_mismatch"], row["others_mismatch"]) == (False, True, False)
+    else:
+        assert {"template_mismatch", "retoken_mismatch", "others_mismatch"}.isdisjoint(row)
+    assert len(calls) == (6 if enabled else 4)
+    assert len(batch) == 2
+    if score_centering:
+        assert batch.non_tensor_batch["score_centering"].tolist() == [
+            {"token_ids": [[2]], "log_probs": [[-0.1]]},
+            {"token_ids": [[2]], "log_probs": [[-0.1]]},
+        ]
+    else:
+        assert "score_centering" not in batch.non_tensor_batch
+
+
+@pytest.mark.parametrize("classify_mismatches", [False, True], ids=["disabled", "enabled"])
+@pytest.mark.parametrize(
+    ("prompt", "response", "next_prompt", "use_tokenizer", "expected"),
+    [
+        ([1], [2], [3, 4], True, (False, True, False)),
+        ([1, 6], [7, 2], [1, 2, 4], True, (False, False, True)),
+        ([1, 10], [2, 11], [1, 2, 4], True, (False, False, True)),
+        ([9], [5], [3, 5, 4], True, (False, False, True)),
+        ([1], [2], [8, 4], True, (False, False, True)),
+        ([1, 6], [7, 2], [8, 4], True, (False, False, True)),
+        ([1, 12], [13, 2], [1, 2, 4], True, (False, False, True)),
+        ([6], [7], [8, 4], True, (False, False, True)),
+        ([-1], [2], [3, 4], True, (False, False, True)),
+        ([1], [2], [3, 4], False, (False, False, True)),
+        ([1], [2], [1], True, (False, False, True)),
+        ([1], [2] + [4] * 126, [3] + [4] * 126, True, (False, True, False)),
+        ([1], [2] + [4] * 127, [3] + [4] * 127, True, (False, False, True)),
+        ([1], [2], [3] + [4] * 128, True, (False, False, True)),
+    ],
+    ids=[
+        "retoken",
+        "think-delimiters",
+        "tool-call-delimiters",
+        "whitespace",
+        "content",
+        "template-and-content",
+        "unknown-delimiters",
+        "empty-text",
+        "decode-error",
+        "no-tokenizer",
+        "response-cannot-complete-prefix",
+        "previous-128",
+        "previous-129",
+        "prompt-129",
+    ],
+)
+def test_trajectory_mismatch_classification_preserves_training_data(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: list[int],
+    response: list[int],
+    next_prompt: list[int],
+    use_tokenizer: bool,
+    expected: tuple[bool, bool, bool],
+    classify_mismatches: bool,
+) -> None:
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            models.WordLevel(
+                {
+                    "[UNK]": 0,
+                    "hello": 1,
+                    "world": 2,
+                    "hello world": 3,
+                    "obs": 4,
+                    "done": 5,
+                    "<think>": 6,
+                    "</think>": 7,
+                    "changed": 8,
+                    "hello\nworld": 9,
+                    "<tool_call>": 10,
+                    "</tool_call>": 11,
+                    "<custom>": 12,
+                    "</custom>": 13,
+                },
+                unk_token="[UNK]",
+            )
+        ),
+        unk_token="[UNK]",
+    )
+    logged: list[tuple[dict[str, FakeTable], int]] = []
+    _install_fake_wandb(monkeypatch, logged)
+    triplets = [_triplet(prompt, response), _triplet(next_prompt, [2])]
+    for triplet in triplets:
+        routes = np.arange(
+            (len(triplet.prompt["token_ids"]) + len(triplet.response["token_ids"])) * 4,
+            dtype=np.uint8,
+        ).reshape(-1, 2, 2)
+        triplet.response["routed_experts"] = _encode_routes(routes)
+    rollout = CompletedRollout(
+        rollout_id="classification",
+        data_id="data-1",
+        step=0,
+        sample_idx_in_step=0,
+        enqueue_time=0.0,
+        final_reward=0.75,
+        triplets=triplets,
+    )
+    original = rollout.model_copy(deep=True)
+    adapter = RolloutAdapter(
+        max_prompt_length=12,
+        max_response_length=12,
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        trace_aggregator_level="trajectory",
+        require_routed_experts=True,
+        classify_trace_merge_mismatches=classify_mismatches,
+    )
+    baseline, baseline_metrics = adapter.get_train_data_batch([rollout])
+    logged.clear()
+    adapter.tokenizer = tokenizer if use_tokenizer else None
+    batch, metrics = adapter.get_train_data_batch([rollout])
+
+    table, _ = _logged_table(logged, "training/trace_merge_mismatches")
+    row = dict(zip(table.columns, table.rows[0], strict=True))
+    if classify_mismatches:
+        assert (row["template_mismatch"], row["retoken_mismatch"], row["others_mismatch"]) == expected
+    else:
+        assert {"template_mismatch", "retoken_mismatch", "others_mismatch"}.isdisjoint(row)
+    assert len(table.rows) == 1
+    assert len(batch) == 2  # Diagnostic classification never relaxes the exact token-prefix split.
+    assert rollout == original
+    assert metrics == baseline_metrics
+    assert batch.batch is not None and baseline.batch is not None
+    assert set(batch.batch.keys()) == set(baseline.batch.keys())
+    for key, value in baseline.batch.items():
+        torch.testing.assert_close(batch.batch[key], value)
+    for key, value in baseline.non_tensor_batch.items():
+        np.testing.assert_array_equal(batch.non_tensor_batch[key], value)
+
+
+@pytest.mark.parametrize(
+    ("previous_size", "prompt_size", "expected_calls"),
+    [(128, 128, [128, 128]), (129, 128, []), (128, 129, []), (4096, 4096, [])],
+)
+def test_mismatch_classification_bounds_decoding(
+    previous_size: int, prompt_size: int, expected_calls: list[int]
+) -> None:
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+    )
+    calls: list[int] = []
+
+    class CountedTokenizer:
+        def decode(self, ids: list[int], **kwargs: Any) -> str:
+            calls.append(len(ids))
+            text = tokenizer.decode(ids, **kwargs)
+            assert isinstance(text, str)
+            return text
+
+    result = rollout_adapter_module._classify_trace_merge_mismatch(
+        CountedTokenizer(), [1] * previous_size, [1] * prompt_size
+    )
+    assert calls == expected_calls
+    assert result == ((False, True, False) if expected_calls else (False, False, True))
+
+
+def test_mismatch_classification_does_not_use_response_or_numeric_fallback() -> None:
+    assert rollout_adapter_module._classify_trace_merge_mismatch(None, [1], [1]) == (False, False, True)
+    # The next response could complete a decoded prefix; only the prompt is eligible.
+    assert rollout_adapter_module._classify_trace_merge_mismatch(FakeTokenizer(), [1, 2], [1]) == (
+        False,
+        False,
+        True,
+    )
+
+
+def test_mismatch_classification_keeps_legacy_decoder_and_rejects_invalid_text() -> None:
+    class LegacyTokenizer:
+        def decode(self, ids: list[int]) -> str:
+            return " ".join(str(token) for token in ids)
+
+    assert rollout_adapter_module._classify_trace_merge_mismatch(LegacyTokenizer(), [1], [1, 2]) == (
+        False,
+        True,
+        False,
+    )
+    invalid = SimpleNamespace(decode=lambda ids, **kwargs: None)
+    assert rollout_adapter_module._classify_trace_merge_mismatch(invalid, [1], [1, 2]) == (False, False, True)
+
+
+@pytest.mark.parametrize(
+    ("context_size", "classify_mismatches", "expected_decode_calls"),
+    [(2, False, 202), (129, False, 202), (2, True, 402), (129, True, 202)],
+)
+def test_mismatch_decoding_stops_at_table_limit(
+    monkeypatch: pytest.MonkeyPatch, context_size: int, classify_mismatches: bool, expected_decode_calls: int
+) -> None:
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1, "world": 2}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+    )
+    calls: list[int] = []
+
+    class CountedTokenizer:
+        def decode(self, ids: list[int], **kwargs: Any) -> str:
+            calls.append(len(ids))
+            text = tokenizer.decode(ids, **kwargs)
+            assert isinstance(text, str)
+            return text
+
+    logged: list[tuple[dict[str, FakeTable], int]] = []
+    _install_fake_wandb(monkeypatch, logged)
+    rollout = CompletedRollout(
+        rollout_id="bounded",
+        data_id="data-1",
+        step=0,
+        sample_idx_in_step=0,
+        enqueue_time=0.0,
+        final_reward=0.5,
+        triplets=[_triplet([1 + turn % 2] * (context_size - 1), [1]) for turn in range(102)],
+    )
+    adapter = _adapter()
+    adapter.tokenizer = CountedTokenizer()
+    adapter.classify_trace_merge_mismatches = classify_mismatches
+    adapter.get_train_data_batch([rollout])
+    table, _ = _logged_table(logged, "training/trace_merge_mismatches")
+    assert len(table.rows) == 100
+    # Each row decodes two traces; the trajectory summary decodes its final prompt/response.
+    # Only enabled, short rows add classifier decodes, and none are added beyond the 100-row cap.
+    assert len(calls) == expected_decode_calls
+
+
+def test_training_step_uploads_24_compact_rollout_trajectories_to_wandb_zip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[tuple[dict[str, FakeTable], int]] = []
+    run = _install_fake_wandb(monkeypatch, logged)
+    rollouts = [
+        CompletedRollout(
+            rollout_id=f"r{index}",
+            data_id=f"data-{index}",
+            step=23,
+            sample_idx_in_step=index,
+            enqueue_time=0.0,
+            final_reward=float(index),
+            triplets=[
+                _triplet([index], [index + 100]),
+                _triplet([index, index + 100, index + 200], [index + 300]),
+            ],
+        )
+        for index in range(1, 27)
+    ]
+
+    _adapter().get_train_data_batch(rollouts, global_steps=23)
+
+    table, step = _logged_table(logged, "training/rollout_trajectories")
+    assert step == 23
+    assert table.columns == ["global_steps", "trajectory_artifact", "trajectory_artifact_path", "row_count"]
+    artifact_name = "train-trajectories-fake-run-step-23"
+    artifact_path = "step_23/train_trajectories.jsonl.zip"
+    assert table.rows == [[23, artifact_name, artifact_path, 24]]
+
+    assert len(run.artifacts) == 1
+    artifact = run.artifacts[0]
+    assert artifact.name == artifact_name
+    assert artifact.type == "train_trajectories"
+    assert artifact.metadata == {"global_steps": 23, "row_count": 24, "format": "jsonl.zip"}
+    assert [file["name"] for file in artifact.files] == [artifact_path]
+
+    records = _zipped_jsonl_records(
+        artifact,
+        artifact_path=artifact_path,
+        jsonl_name="train_trajectories.jsonl",
+    )
+    assert len(records) == 24
+    assert all(set(record) == {"rollout_id", "reward", "prompt", "response"} for record in records)
+    assert [record["rollout_id"] for record in records] == [f"r{index}" for index in range(1, 25)]
+    assert records[0] == {"rollout_id": "r1", "reward": 1.0, "prompt": "1 101 201", "response": "301"}
+    assert records[-1] == {
+        "rollout_id": "r24",
+        "reward": 24.0,
+        "prompt": "24 124 224",
+        "response": "324",
+    }
+
+
+def test_validation_uploads_all_compact_rollout_trajectories_to_wandb_zip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[tuple[dict[str, FakeTable], int]] = []
+    run = _install_fake_wandb(monkeypatch, logged)
+    rollouts = [
+        CompletedRollout(
+            rollout_id=f"vr{index}",
+            data_id=f"val-data-{index}",
+            step=31,
+            sample_idx_in_step=index,
+            enqueue_time=0.0,
+            final_reward=float(index),
+            triplets=[
+                _triplet([index], [index + 10]),
+                _triplet([index, index + 10, index + 20], [index + 30]),
+            ],
+        )
+        for index in range(1, 8)
+    ]
+
+    metrics = _adapter().get_test_metrics(rollouts, global_steps=31)
+
+    assert metrics["val/reward"] == 4.0
+    assert metrics["val/n_rollouts"] == 7
+    assert metrics["val/n_rollouts_w_trace"] == 7
+    assert metrics["val/n_rollouts_w_reward"] == 7
+    assert metrics["val/mean_response_length_per_turn"] == 1.0
+    assert metrics["val/mean_total_response_length_per_rollout"] == 2.0
+    assert metrics["val/turn_count"] == 2.0
+
+    table, step = _logged_table(logged, "val/rollout_trajectories")
+    assert step == 31
+    assert table.columns == ["global_steps", "trajectory_artifact", "trajectory_artifact_path", "row_count"]
+    artifact_name = "validation-trajectories-fake-run-step-31"
+    artifact_path = "step_31/validation_trajectories.jsonl.zip"
+    assert table.rows == [[31, artifact_name, artifact_path, 7]]
+
+    assert len(run.artifacts) == 1
+    artifact = run.artifacts[0]
+    assert artifact.name == artifact_name
+    assert artifact.type == "validation_trajectories"
+    assert artifact.metadata == {"global_steps": 31, "row_count": 7, "format": "jsonl.zip"}
+
+    records = _zipped_jsonl_records(
+        artifact,
+        artifact_path=artifact_path,
+        jsonl_name="validation_trajectories.jsonl",
+    )
+    assert len(records) == 7
+    assert all(set(record) == {"rollout_id", "reward", "prompt", "response"} for record in records)
+    assert [record["rollout_id"] for record in records] == [f"vr{index}" for index in range(1, 8)]
+    assert records[0] == {"rollout_id": "vr1", "reward": 1.0, "prompt": "1 11 21", "response": "31"}
+    assert records[-1] == {"rollout_id": "vr7", "reward": 7.0, "prompt": "7 17 27", "response": "37"}
+
+
+# ---------------------------------------------------------------------------
+# Multimodal (image) support tests
+# ---------------------------------------------------------------------------
+
+
+class FakeMropeProcessor:
+    """Stand-in for a Qwen-VL style HF processor (mrope models)."""
+
+    def __call__(self, text: object = None, images: list | None = None, return_tensors: object = None) -> dict:
+        n_images = len(images or [])
+        return {
+            "input_ids": torch.zeros(1, 2, dtype=torch.long),
+            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+            "pixel_values": torch.full((max(n_images, 1), 4), float(n_images)),
+            "image_grid_thw": torch.tensor([[1, 1, 1]] * n_images, dtype=torch.long),
+        }
+
+    def get_rope_index(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        image_grid_thw: object = None,
+        video_grid_thw: object = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        # Deterministic stand-in for HF's get_rope_index: (3, batch, seq) cumsum positions.
+        positions = (attention_mask.cumsum(-1) - 1).clamp(min=0)
+        return positions.unsqueeze(0).expand(3, -1, -1).contiguous()
+
+
+class FakeNonMropeProcessor:
+    """Stand-in for a non-mrope VLM processor: pixel_values only, no image_grid_thw."""
+
+    def __call__(self, text: object = None, images: list | None = None, return_tensors: object = None) -> dict:
+        n_images = len(images or [])
+        return {
+            "input_ids": torch.zeros(1, 2, dtype=torch.long),
+            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+            "pixel_values": torch.ones(max(n_images, 1), 3),
+        }
+
+
+class FakeEmptyProcessor:
+    """Stand-in for a processor that returns no vision tensors at all."""
+
+    def __call__(self, text: object = None, images: object = None, return_tensors: object = None) -> dict:
+        return {
+            "input_ids": torch.zeros(1, 2, dtype=torch.long),
+            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+        }
+
+
+def _transition_adapter(
+    processor: object = None,
+    *,
+    max_prompt_length: int = 8,
+    max_response_length: int = 4,
+) -> RolloutAdapter:
+    return RolloutAdapter(
+        max_prompt_length=max_prompt_length,
+        max_response_length=max_response_length,
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        trace_aggregator_level="transition",
+        tokenizer=FakeTokenizer(),
+        processor=processor,
+    )
+
+
+def _image_triplet(prompt_ids: list[int], response_ids: list[int], image_urls: list[str] | None = None) -> Triplet:
+    return Triplet(
+        prompt={"token_ids": prompt_ids},
+        response={"token_ids": response_ids, "log_probs": [-0.1] * len(response_ids)},
+        image_urls=image_urls,
+    )
+
+
+def _transition_rollout(triplets: list[Triplet], rollout_id: str = "r1") -> CompletedRollout:
+    return CompletedRollout(
+        rollout_id=rollout_id,
+        data_id="data-1",
+        step=1,
+        sample_idx_in_step=0,
+        enqueue_time=0.0,
+        final_reward=1.0,
+        triplets=triplets,
+    )
+
+
+def _stub_image_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rollout_adapter_module, "_load_pil_image", lambda url: object())
+
+
+def test_transition_image_rows_attach_multi_modal_inputs_and_mrope_position_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_image_loading(monkeypatch)
+    rollout = _transition_rollout(
+        [
+            _image_triplet([1, 2, 3], [4, 5], image_urls=["data:image/jpeg;base64,QUJD"]),
+            _image_triplet([6], [7]),
+        ]
+    )
+
+    batch, _ = _transition_adapter(FakeMropeProcessor()).get_train_data_batch([rollout], global_steps=1)
+
+    assert batch.batch["is_drop_mask"].tolist() == [False, False]
+    assert "multi_modal_inputs" in batch.non_tensor_batch
+    multi_modal_inputs = list(batch.non_tensor_batch["multi_modal_inputs"])
+    assert len(multi_modal_inputs) == 2
+    assert multi_modal_inputs[0] is not None
+    assert set(multi_modal_inputs[0]) == {"pixel_values", "image_grid_thw"}
+    assert torch.equal(multi_modal_inputs[0]["image_grid_thw"], torch.tensor([[1, 1, 1]]))
+    assert multi_modal_inputs[1] is None
+
+    # verl's FSDP engine detects mrope via position_ids.dim() == 3: (n_sample, 4, seq_len).
+    position_ids = batch.batch["position_ids"]
+    assert position_ids.dim() == 3
+    assert position_ids.shape == (2, 4, 12)  # max_prompt_length 8 + max_response_length 4
+
+
+def test_text_only_rows_keep_original_behavior_with_processor() -> None:
+    triplets = [_image_triplet([1, 2], [3, 4]), _image_triplet([5], [6, 7])]
+    rollouts = [_transition_rollout(triplets)]
+
+    batch_with, metrics_with = _transition_adapter(FakeMropeProcessor()).get_train_data_batch(rollouts, global_steps=1)
+    batch_without, metrics_without = _transition_adapter(None).get_train_data_batch(rollouts, global_steps=1)
+
+    # No images in the traces: a configured processor must not change anything.
+    assert batch_with.batch["position_ids"].dim() == 2
+    assert "multi_modal_inputs" not in batch_with.non_tensor_batch
+    assert set(batch_with.batch.keys()) == set(batch_without.batch.keys())
+    for key in set(batch_without.batch.keys()):
+        assert torch.equal(batch_with.batch[key], batch_without.batch[key])
+    assert set(batch_with.non_tensor_batch.keys()) == set(batch_without.non_tensor_batch.keys())
+    assert metrics_with == metrics_without
+
+
+def test_trajectory_level_with_image_triplets_raises() -> None:
+    rollout = _transition_rollout([_image_triplet([1], [2], image_urls=["data:image/jpeg;base64,QUJD"])])
+    adapter = RolloutAdapter(
+        max_prompt_length=8,
+        max_response_length=4,
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        trace_aggregator_level="trajectory",
+        tokenizer=FakeTokenizer(),
+        processor=FakeMropeProcessor(),
+    )
+
+    with pytest.raises(ValueError, match=r"trace_aggregator\.level: transition"):
+        adapter.get_train_data_batch([rollout], global_steps=1)
+
+
+def test_truncated_image_prompt_falls_back_to_text_only(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_image_loading(monkeypatch)
+    adapter = _transition_adapter(FakeMropeProcessor(), max_prompt_length=2)
+    rollout = _transition_rollout([_image_triplet([1, 2, 3, 4], [5], image_urls=["data:image/jpeg;base64,QUJD"])])
+
+    batch, _ = adapter.get_train_data_batch([rollout], global_steps=1)
+
+    # The prompt is truncated (is_drop): the row trains as text-only and is
+    # filtered by is_drop_mask downstream.
+    assert batch.batch["is_drop_mask"].tolist() == [True]
+    multi_modal_inputs = list(batch.non_tensor_batch["multi_modal_inputs"])
+    assert multi_modal_inputs[0] is None
+    assert "truncated (is_drop) prompt with images" in capsys.readouterr().out
+
+
+def test_non_mrope_processor_attaches_multi_modal_inputs_and_keeps_2d_position_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_image_loading(monkeypatch)
+    rollout = _transition_rollout([_image_triplet([1, 2], [3], image_urls=["data:image/jpeg;base64,QUJD"])])
+
+    batch, _ = _transition_adapter(FakeNonMropeProcessor()).get_train_data_batch([rollout], global_steps=1)
+
+    multi_modal_inputs = list(batch.non_tensor_batch["multi_modal_inputs"])
+    assert multi_modal_inputs[0] is not None
+    assert set(multi_modal_inputs[0]) == {"pixel_values"}
+    assert batch.batch["is_drop_mask"].tolist() == [False]
+    assert batch.batch["position_ids"].dim() == 2
+    assert "not a recognized mrope" in capsys.readouterr().out
+
+
+def test_processor_without_vision_output_marks_image_row_for_drop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_image_loading(monkeypatch)
+    rollout = _transition_rollout([_image_triplet([1, 2], [3], image_urls=["data:image/jpeg;base64,QUJD"])])
+
+    batch, _ = _transition_adapter(FakeEmptyProcessor()).get_train_data_batch([rollout], global_steps=1)
+
+    multi_modal_inputs = list(batch.non_tensor_batch["multi_modal_inputs"])
+    assert multi_modal_inputs[0] is None
+    assert batch.batch["is_drop_mask"].tolist() == [True]
+    keep = (~batch.batch["is_drop_mask"].bool()).nonzero(as_tuple=True)[0].tolist()
+    assert batch[keep].non_tensor_batch["rollout_id_list"].tolist() == []
+    assert "no vision tensors" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure", ["missing_processor", "image_decode", "missing_grid", "mrope"])
+def test_failed_image_rows_are_removed_by_trainer_filter(failure: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    processor = FakeMropeProcessor() if failure != "missing_processor" else None
+    if failure == "missing_grid":
+        monkeypatch.setattr(FakeMropeProcessor, "__call__", FakeNonMropeProcessor.__call__)
+    if failure == "mrope":
+        assert processor is not None
+        original_get_rope_index = processor.get_rope_index
+
+        def fail_image_positions(
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            image_grid_thw: object = None,
+            **kwargs: object,
+        ) -> torch.Tensor:
+            if image_grid_thw is not None:
+                raise ValueError("image token count does not match the image grid")
+            return original_get_rope_index(input_ids, attention_mask, **kwargs)
+
+        monkeypatch.setattr(processor, "get_rope_index", fail_image_positions)
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2)).save(buffer, format="PNG")
+    payload = "QUJD" if failure == "image_decode" else base64.b64encode(buffer.getvalue()).decode()
+    image_url = f"data:image/png;base64,{payload}"
+    bad = _transition_rollout([_image_triplet([1, 2], [3], image_urls=[image_url])], rollout_id="bad-image")
+    good = _transition_rollout([_image_triplet([1, 2], [4])], rollout_id="good-text")
+    batch, _ = _transition_adapter(processor).get_train_data_batch([bad, good])
+
+    assert batch.batch["is_drop_mask"].tolist() == [True, False]
+    # The trainer applies this DataProto selection before building PPO minibatches.
+    keep = (~batch.batch["is_drop_mask"].bool()).nonzero(as_tuple=True)[0].tolist()
+    train_batch = batch[keep]
+    assert train_batch.non_tensor_batch["rollout_id_list"].tolist() == ["good-text"]
+    assert train_batch.batch["responses"].tolist() == [[4, 0, 0, 0]]
+    assert train_batch.batch["token_level_scores"].sum(-1).tolist() == [1.0]
+
+
+def test_is_mrope_processor_detection() -> None:
+    class Qwen2_5_VLProcessor:
+        pass
+
+    assert rollout_adapter_module._is_mrope_processor(None) is False
+    assert rollout_adapter_module._is_mrope_processor(FakeMropeProcessor()) is True
+    assert rollout_adapter_module._is_mrope_processor(Qwen2_5_VLProcessor()) is True
+    assert rollout_adapter_module._is_mrope_processor(FakeNonMropeProcessor()) is False
+
+
+def test_load_pil_image_decodes_data_url() -> None:
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(buffer, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    image = rollout_adapter_module._load_pil_image(url)
+
+    assert image.size == (2, 2)
+    assert image.mode == "RGB"
+
+
+@pytest.mark.parametrize("filename", ["plain.png", "frame one.png", "图像.png", "frame%20.png"])
+def test_load_pil_image_decodes_file_uri(tmp_path: Path, filename: str) -> None:
+    from PIL import Image
+
+    image_path = tmp_path / filename
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(image_path)
+    # A second unquote would load the wrong image for the literal-percent case.
+    if filename == "frame%20.png":
+        Image.new("RGB", (2, 2), (0, 0, 255)).save(tmp_path / "frame .png")
+
+    image = rollout_adapter_module._load_pil_image(image_path.as_uri())
+
+    assert image.size == (2, 2)
+    assert image.mode == "RGB"
+    assert image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_file_uri_image_row_is_kept_for_training(tmp_path: Path) -> None:
+    from PIL import Image
+
+    image_path = tmp_path / "frame 50%.png"
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(image_path)
+    rollout = _transition_rollout([_image_triplet([1, 2], [3], image_urls=[image_path.as_uri()])])
+
+    batch, _ = _transition_adapter(FakeMropeProcessor()).get_train_data_batch([rollout])
+
+    assert batch.batch["is_drop_mask"].tolist() == [False]
+    assert batch.non_tensor_batch["multi_modal_inputs"][0] is not None
+    keep = (~batch.batch["is_drop_mask"].bool()).nonzero(as_tuple=True)[0].tolist()
+    assert batch[keep].non_tensor_batch["rollout_id_list"].tolist() == [rollout.rollout_id]
+
+
+def test_load_pil_image_fetches_remote_url_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("PIL")
+    httpx = pytest.importorskip("httpx")
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(buffer, format="PNG")
+
+    class _FakeResponse:
+        headers: ClassVar[dict[str, str]] = {"content-type": "image/png"}
+        content = buffer.getvalue()
+
+        def raise_for_status(self) -> None:
+            pass
+
+    # Remote fetching is allowed by default (no opt-in env var).
+    monkeypatch.setattr(httpx, "get", lambda *args, **kwargs: _FakeResponse())
+
+    image = rollout_adapter_module._load_pil_image("https://example.com/image.jpg")
+
+    assert image.size == (2, 2)
+    assert image.mode == "RGB"

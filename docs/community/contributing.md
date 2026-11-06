@@ -1,253 +1,122 @@
-# Contributing Guide
+# Contributing to Agent Lightning
 
-Agent Lightning gets better every time someone files a clear bug, polishes docs, improves tests, or lands a new feature. This guide collects the expectations, checklists, and tips that help you go from “I have an idea” to “my pull request just merged.”
+Thanks for your interest in Agent Lightning! This page covers the recommended contribution points,
+how to set up a development environment, and what reviewers expect from a pull request.
 
-## Before You Start
+## Ways to contribute
 
-Agent-lightning is built by a small Microsoft Research team with limited reviewer hours and GPU budget. For any sizeable change (new algorithm, example, or API surface) please first discuss scope with us in [Discord](https://discord.gg/RYk7CdvDR7). Early alignment keeps your effort from being blocked late in the process.
+- **Bug reports.** A clear report is a contribution in itself. Include what you ran, what you
+  expected, what happened, and a minimal reproduction. For agentic RL issues, the rollout logs and
+  the shapes of the tensors involved are usually what makes a report actionable.
+- **Examples.** `examples/` holds runnable harnesses for different agents and backends. New examples
+  that show a supported workflow end to end are welcome.
+- **Documentation.** `docs/` is built with MkDocs; corrections and clarifications to configuration
+  semantics are especially useful, because the training behaviour is easy to misread.
+- **Tests.** `tests/` runs on CPU with the `verl-cpu` dependency group (see below), so a regression
+  test for a bug you hit is cheap to add and keeps the bug fixed.
+- **Code.** `agentlightning/` is deliberately small: the server, the rollout controller and the VERL
+  integration. Changes that keep that surface small are easier to review.
 
-## Where You Can Help
+Look for issues labelled
+[`good first issue`](https://github.com/microsoft/agent-lightning/labels/good%20first%20issue) or
+[`help wanted`](https://github.com/microsoft/agent-lightning/labels/help%20wanted)
+for tasks the maintainers have already scoped.
 
-Pick a lane, or combine several. Just keep the discussion-first principle in mind for anything non-trivial.
+## Development environment
 
-### Documentation Improvements
-
-Documentation improvements are the easiest way to get started. You can find more about how to write good documentations and organize documentations in the following sections. Here are some general contribution points we can think of:
-
-- Tighten language, fix typos, clarify confusing sections, or add missing links. Fresh eyes catch docs gaps best.
-- Organize content using the directories listed below so readers can actually find it.
-- Avoid duplicate prose, unrelated “how-to” guides, or translations (we cannot maintain them today).
-
-!!! note "Changes that are usually rejected"
-
-    - Copy/pasting existing docs with shallow edits.
-    - Adding a `how-to` guide that is not tied to a new example.
-    - Adding doc translations to other languages (no capacity to review/maintain yet).
-
-### Bug Fixes
-
-Bug fixes are the fastest way to get familiar with the codebase. To get started, you can:
-
-- Browse the ["help wanted"](https://github.com/microsoft/agent-lightning/labels/help%20wanted) and ["bug"](https://github.com/microsoft/agent-lightning/labels/bug) labels; drop a comment before you start so we can mark it as taken.
-- For fresh bugs, open an issue with reproduction steps, logs, and expected behavior before submitting a fix.
-- Keep each pull request focused, ideally avoiding breaking API changes. Larger refactors should be discussed via RFC or maintainer sync.
-
-### New Examples
-
-Examples must be curated so that we can maintain them. We generally merge only those that meet at least one (ideally several) of these criteria:
-
-- Demonstrates an agent framework or workflow that is materially different from what already exists. ([LangChain](https://www.langchain.com/) vs. [LlamaIndex](https://www.llamaindex.ai/) is not different enough; [LangChain](https://www.langchain.com/) vs. [n8n](https://n8n.io/) or [Vercel AI SDK](https://ai-sdk.dev/) is, because they either have different orchestration paradigms or differ in programming languages.)
-- Shows measurable performance gains on a **real-world** problem with a **real-world** dataset, such as tuning a search agent with Google Search API or improving a coding agent’s (e.g., Claude Code) SWE-Bench score.
-- Integrates a new algorithm, training backend, or serving stack (see “New Algorithms” below).
-- Validates scenarios that are rarely tested, such as multi-modality agents or long-lived memory/workflow agents.
-
-Bonus points for examples that:
-
-- Ship CI or self-test coverage so we know they still work as the core evolves.  **Otherwise, we would have to mark the example as unmaintained because we won't be able to test the examples manually before each release.**
-- Include a [`docs/how-to/`]({{ src("docs/how-to/") }}) guide (or a detailed README if no how-to exists) without duplicating content in multiple places.
-- Favor simple, dependency-light code over heavy abstractions.
-- Ship a README that documents smoke-test instructions and includes an "Included Files" section summarizing every file and its role; keep the runnable module self-contained with a module-level docstring explaining CLI usage, plus targeted docstrings or inline comments for educational functions/classes.
-
-!!! warning "Please discuss first"
-
-    Examples tend to be the most time-consuming contributions for both you and reviewers. Sync with us on Discord or through an issue before diving into a new one.
-
-### Fresh Implementations of Core Modules
-
-If you are looking to extend [`Runner`][agentlightning.Runner], [`Tracer`][agentlightning.Tracer], [`Adapter`][agentlightning.Adapter], [`LightningStore`][agentlightning.LightningStore], or another core interface, here are the steps:
-
-1. File an issue or proposal first.
-2. Explain which interface you are extending, why existing implementations are insufficient, and how you intend to test compatibility with the rest of the stack (unit tests, documentation updates, example refreshes, etc.).
-3. Any API changes must be reviewed up front. DO NOT begin coding large changes before the discussion lands!
-
-### New Algorithms
-
-If you are integrating a new training/serving backend, check whether it already lives in the [Algorithm Zoo](../algorithm-zoo/index.md) or is covered in the [Examples Catalog](../how-to/examples-catalog.md). We especially welcome:
-
-- Currently unsupported or under-tested algorithms such as Supervised Fine-tuning (SFT), Direct Policy Optimization (DPO), or Monte Carlo Tree Search (MCTS).
-- Tuning [Resource][agentlightning.Resource]s that are not supported yet, such as workflows or memory.
-- Expansions of supported stacks, e.g., adding multi-modality to APO or multi-agent prompt tuning.
-- Reinforcement-learning integrations beyond our current stack of [VERL](https://github.com/volcengine/verl), [vLLM](https://vllm.ai/), [Azure OpenAI](https://azure.microsoft.com/en-us/products/ai-foundry/models/openai), and [Tinker](https://tinker-docs.thinkingmachines.ai/). Contributions using [SGLang](https://github.com/sgl-project/sglang), [TRL](https://github.com/huggingface/trl), [SkyRL](https://github.com/NovaSky-AI/SkyRL), [RLinf](https://github.com/RLinf/RLinf), [litgpt](https://github.com/Lightning-AI/litgpt), or similar are welcome.
-
-Most brand-new algorithms ultimately land as “new examples,” so read that section too. Post an issue or design doc to scope the work, reuse existing utilities, and avoid duplicating efforts. Mature, battle-tested examples graduate into the [Algorithm Zoo](../algorithm-zoo/index.md).
-
-### Ecosystem Projects
-
-Have a project that builds on Agent-lightning but does not belong in the main repo? Fork it or depend on it externally, then let us know. We can showcase notable projects in [Community Projects](../index.md) and the main [README]({{ src("README.md") }}).
-
-### Agent-lightning Contrib
-
-[`contrib/`]({{ src("contrib") }}) is where work-in-progress or third-party integrations, and curated recipes live before they are hardened enough for the core runtime tree. Think of it as an incubator: additions should remain easy to consume, clearly owned, and scoped so downstream users can vendor them with minimal risk.
-
-The following types of contributions are welcome in the contrib area:
-
-- **Recipes** that assemble multiple Agent Lightning components for a narrow task (`contrib/recipes/<topic>/`). Each recipe must be self-contained, include running instructions and result reports.
-- **Runtime extensions** that would bloat the primary `agentlightning/` namespace (`contrib/agentlightning/contrib/<feature>/`). These should mirror the published wheel layout so that `import agentlightning.contrib.<feature>` works out of the box.
-- **Supporting scripts and assets** (`contrib/scripts/`) that automate dataset downloads, environment preparation, or benchmarks required by contrib modules.
-
-If you are unsure where a contribution should live, start a thread in Discord or open an issue before writing code. The [contrib README]({{ src("contrib/README.md") }}) also lists the directory expectations.
-
-A quick checklist for contributions to be accepted:
-
-1. **Document everything.** Include configuration steps, environment variables, and sample commands so contributors can reproduce the results without guesswork. Pin to a specific version of Agent-lightning and other dependencies to avoid unexpected changes if you don't want to update the recipe frequently.
-2. **Keep quality predictable.** Match the repo’s style guide, apply exhaustive type hints, and run `uv run --no-sync pyright` plus targeted `pytest` suites for any Python module you touch.
-3. **Ship reproducibility artifacts.** Store only scripts or instructions for downloading datasets, weights, or binaries. Never upload large artifacts or credentials directly.
-4. **Update ownership.** Add `CODEOWNERS` entries when new directories appear so maintainers know who can review follow-up fixes.
-
-Contrib entries do not need the same maturity level as core code, but they must still meet the baseline above. Submissions that lack documentation, hide ownership, or depend on untracked assets are typically rejected until those gaps are resolved.
-
-### Other Contribution Ideas
-
-- **Tests.** Add or improve cases in [`tests/`]({{ src("tests") }}) (unit, integration, or end-to-end).
-- **Benchmarks.** Expand [`tests/benchmark`]({{ src("tests/benchmark") }}) to stress large-scale training or rollouts.
-- **Issue triage.** Reproduce bugs, confirm whether they reproduce on `main`, or suggest short-term mitigations so maintainers can prioritize.
-
-## Contribution Workflow
-
-The steps below keep changes reviewable and CI-friendly. Follow them in order; rerun the relevant pieces if you revisit a branch later.
-
-### 1. Prepare Your Environment
-
-Minimum tooling:
-
-- **Python** 3.10+ (3.12 recommended).
-- **uv** for dependency and virtual-environment management. Install it using the [official uv docs](https://docs.astral.sh/uv/getting-started/installation/).
-- **Git** configured with your GitHub credentials.
-
-Clone your fork and point `upstream` at the official repo:
+Agent Lightning requires Python 3.12 and uses [uv](https://docs.astral.sh/uv/) for environments and
+locking. The commands below are the ones CI runs, so running them locally reproduces CI exactly.
 
 ```bash
-git clone git@github.com:<your-username>/agent-lightning.git
+git clone https://github.com/microsoft/agent-lightning.git
 cd agent-lightning
-git remote add upstream https://github.com/microsoft/agent-lightning.git
+
+# Lint, formatting and type-checking
+uv sync --frozen --no-default-groups --extra dev --group dev
+uv run --locked --no-sync pre-commit run --all-files --show-diff-on-failure
+uv run --locked --no-sync ruff check .
+uv run --locked --no-sync ruff format --check .
+uv run --locked --no-sync python scripts/check_headers.py
+
+# Type checking and tests (verl-cpu pulls a CPU build of torch and VERL)
+uv sync --frozen --no-default-groups --extra dev --group dev --group verl-cpu
+uv run --locked --no-sync pyright
+uv run --locked --no-sync pytest -v --durations=20 tests
 ```
 
-Install the default development stack:
+The whole test suite runs on CPU — no GPU is needed for `pytest tests`. That is only true of the
+tests: any real rollout-driven training needs the `verl` GPU stack, although no cluster is required
+for the simplest path — the [Quick Start](https://github.com/microsoft/agent-lightning/blob/main/docs/01-quick-start.md)
+trains on a single machine with one A100 using the local controller.
+
+If you changed `docs/`, build them the way CI does:
 
 ```bash
-uv sync --group dev
+uv sync --frozen --no-default-groups --group docs
+uv run --locked --no-sync mkdocs build --strict
 ```
 
-Need GPU extras or specific optional dependencies? Lock them in with one command:
+## Repository layout
 
-```bash
-uv sync --frozen \
-    --extra apo \
-    --extra verl \
-    --group dev \
-    --group torch-cpu \
-    --group torch-stable \
-    --group agents \
-    --no-default-groups
-```
+| Path | What lives there |
+| --- | --- |
+| `agentlightning/server/` | The Agent Lightning server: rollout lifecycle, event storage, the LLM proxy and its routes. |
+| `agentlightning/controller/` | Rollout controllers. In `k8s` mode each rollout runs as a Kubernetes Job; in `local` mode each rollout runs as a subprocess on the Controller machine, so no cluster is needed. |
+| `agentlightning/verl/` | The VERL integration: rollout management, trace-to-training-row adapters, advantage and loss normalization. |
+| `agentlightning/client.py`, `agentlightning/schemas.py` | Client used by the trainer and the shared request/response schemas. |
+| `examples/` | Runnable harnesses (Calc-X, GSM8K, ScienceWorld, Search-R1, Coding Agent, Multimodal QA, ...). |
+| `tests/` | The CPU test suite, including the adapter and normalization unit tests. |
+| `docs/` | This documentation, built with MkDocs. |
+| `skills/`, `.agents/skills/` | Agent-facing skills shipped with the repository. |
 
-After `uv sync`, run commands via `uv run ...` (add `--no-sync` once the environment is locked) or activate `.venv/`.
+## Pull requests
 
-### 2. Install and Run Pre-commit
+- **Branch off `main`** with a short kebab-case name that says what the branch does, for example
+  `fix/per-rollout-mean-normalization` or `docs/contributing-guide`, and keep it rebased on `main`
+  while it is open. Do not open a pull request from your own `main`.
+- **Keep it focused.** One problem per pull request; split unrelated cleanups out. Small diffs get
+  reviewed much faster than large ones.
+- **Link the issue.** Reference the issue your change addresses in the description, using
+  `Fixes #123` when the pull request resolves it.
+- **Say what, why and how you verified it.** What changed, why it is needed, and the exact commands
+  you ran with their results. When you cannot run something (for example a multi-GPU path), say so
+  explicitly instead of leaving it implied.
+- **Follow the existing style.** Titles in the history look like `fix(verl): ...`,
+  `fix(controller): ...` or `feat(server): ...`. Match the conventions of the module you touch, and
+  keep comments and docstrings in English.
+- **Add or update tests** for behaviour changes, and update the documentation when user-visible
+  behaviour changes.
+- **Keep CI green.** A pull request is ready for review when the lint, type-check, test, package and
+  docs jobs pass.
 
-Formatting and linting are enforced through [pre-commit](https://pre-commit.com/). Install once, then run before each push:
+## Using AI assistants
 
-```bash
-uv run --no-sync pre-commit install
-uv run --no-sync pre-commit run --all-files --show-diff-on-failure --color=always
-```
+This repository ships agent-facing material under `.agents/` and `skills/`, and AI-assisted work is
+fine here. Two expectations keep it reviewable: review the diff yourself so you can explain and
+defend every line, and say in the pull request description that an assistant was involved, so
+reviewers know how to read it. A patch whose author cannot explain it is not ready to be reviewed,
+no matter how it was produced.
 
-Once installed, the hooks run automatically on every `git commit`. Running the pre-commit hooks locally keeps CI green and diffs manageable.
+## Contributor License Agreement
 
-### 3. Branch from Fresh `main` and Code
+Most contributions require you to agree to a Contributor License Agreement (CLA) declaring that you
+have the right to, and actually do, grant us the rights to use your contribution. For details, visit
+<https://cla.opensource.microsoft.com>.
 
-Start all work from the latest upstream state:
+When you open a pull request, a bot determines whether you need to provide a CLA and decorates the
+pull request accordingly (for example with a status check or a comment). Follow the instructions the
+bot provides. You only need to do this once across all repositories using our CLA.
 
-```bash
-git fetch upstream
-git checkout main
-git merge upstream/main
-```
+## Reporting security issues
 
-Branch naming convention:
+Please do not report security vulnerabilities through public GitHub issues. See
+[SECURITY.md](https://github.com/microsoft/agent-lightning/blob/main/SECURITY.md) for the
+reporting process.
 
-- `feature/<short-description>` for new features.
-- `fix/<short-description>` for bug fixes.
-- `docs/<short-description>` for documentation-only updates.
-- `chore/<short-description>` for tooling or maintenance.
+## Code of conduct
 
-Use lowercase with hyphens, e.g., `feature/async-runner-hooks`.
-
-!!! note "Where should docs or examples live?"
-
-    Many new contributors get confused about what to put in the `docs/how-to/` directory and what to put in the `examples/` directory (particularly README files). Here is a quick reference you can refer to:
-
-    | Location | Description |
-    | --- | --- |
-    | `docs/algorithm-zoo/` | Documentation for **built-in algorithms** shipped with Agent-lightning. |
-    | `docs/how-to/` | Step-by-step **how-to guides**, usually tied to an example in `examples/`. |
-    | `docs/tutorials/` | Conceptual walkthroughs for components or workflows. See [debugging](../tutorials/debug.md) or [parallelization](../tutorials/parallelize.md) for examples. |
-    | `docs/deep-dive/` | Advanced explanations and in-depth concepts. |
-    | `examples/<name>/README.md` | Example-specific README. If any related how-to if that exists, link to it avoid duplicating the same instructions twice; write only brief instructions on how to install and run the example. Otherwise, you can make the README more detailed and self-explanatory. |
-
-    Remember to register new docs in [`mkdocs.yml`]({{ src("mkdocs.yml") }}), add examples to [examples/README]({{ src("examples/README.md") }}), and update the [Examples Catalog](../how-to/examples-catalog.md).
-
-Before you start coding, bring the shared coding conventions with you:
-
-- Target `requires-python >= 3.10`, four-space indentation, ~120-character lines (docstrings may run longer), and formatter-owned diffs (Black + isort with the `black` profile).
-- Use `snake_case` for modules, functions, and variables; `PascalCase` for classes and React components; lowercase hyphenation for CLI flags, branch names, and TypeScript filenames.
-- Maintain exhaustive type hints (pyright enforces them), write succinct Google-style docstrings (with `[][]` cross-references).
-- Prefer dataclasses or Pydantic models from `agentlightning.types`.
-- Log via `logging.getLogger(__name__)` with targeted DEBUG/INFO/WARNING/ERROR calls—especially for long multi-step functions or broad `try/except` blocks.
-
-### 4. Test and Validate
-
-Most contributions require automated checks. Once `uv sync` locks dependencies, prefix commands with `uv run --no-sync ...` so they share the same environment as CI.
-
-**Full test suite**
-
-```bash
-uv run --no-sync pytest -v
-```
-
-**Targeted tests**
-
-```bash
-uv run --no-sync pytest tests/path/to/test_file.py -k test_name
-```
-
-**Optional/gated tests:** GPU-specific suites or API-dependent tests run automatically when the required hardware or environment variables (such as `OPENAI_API_KEY`) are present.
-
-**Static analysis:**
-
-```bash
-uv run --no-sync pyright
-```
-
-If you have touched code under `examples/`, you should run the example-specific smoke tests. Each directory includes a README with example-specific smoke tests—run those too.
-
-!!! note "Build documentation when needed"
-
-    Keep API references under [docs/reference]({{ src("docs/reference/") }}) up to date. Doc-only changes should still build cleanly:
-
-    ```bash
-    uv run --no-sync mkdocs serve --strict   # live reload
-    uv run --no-sync mkdocs build --strict   # CI-equivalent
-    ```
-
-    `--strict` elevates warnings to errors so you catch issues before CI.
-
-Before opening a PR, double-check the basics:
-
-- Run `uv lock` if you changed dependencies.
-- Run `uv run --no-sync pre-commit run --all-files --show-diff-on-failure` (hooks installed via `pre-commit install` run automatically on `git commit`, but rerun them if you amended history).
-- Execute the relevant commands from the test list above.
-- Validate each affected example via its README instructions.
-
-### 5. Open a Pull Request
-
-1. Push your branch:
-   ```bash
-   git push origin <branch-name>
-   ```
-2. Open a PR against `microsoft/agent-lightning:main`.
-3. Fill out the template with a concise summary, the commands/tests you ran, and linked issues (use `Fixes #123` syntax to auto-close).
-4. Include screenshots or logs if they clarify behavior.
-5. Address review feedback promptly. Follow-up tweaks work best as focused commits; `git commit --fixup` is handy for reviewer-suggested edits.
-
-Thanks for contributing! every improvement strengthens the Agent Lightning community!
+This project has adopted the
+[Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/). For more
+information see the
+[Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or contact
+[opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
